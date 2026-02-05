@@ -43,6 +43,13 @@ LABEL_COLUMNS_DEFAULT = [
     "Support Devices",
 ]
 
+COMPETITION_LABELS = [
+    "Atelectasis",
+    "Cardiomegaly",
+    "Consolidation",
+    "Edema",
+    "Pleural Effusion",
+]
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -103,24 +110,45 @@ class CheXpertDataset(Dataset):
         return img, labels
 
 
-def compute_accuracy(logits: torch.Tensor, targets: torch.Tensor) -> float:
-    probs = torch.sigmoid(logits)
-    preds = (probs >= 0.5).float()
-    return (preds == targets).float().mean().item()
-
-
-def compute_auc(logits: torch.Tensor, targets: torch.Tensor) -> float:
+def compute_epoch_metrics(
+    logits: torch.Tensor, targets: torch.Tensor, label_names: List[str]
+) -> dict:
     probs = torch.sigmoid(logits).cpu().numpy()
     y_true = targets.cpu().numpy()
-    per_class = []
+    preds = (probs >= 0.5).astype(np.float32)
+
+    acc = float((preds == y_true).mean())
+    per_label_acc = (preds == y_true).mean(axis=0).astype(np.float32).tolist()
+
+    per_label_auc = []
     for i in range(y_true.shape[1]):
         y_i = y_true[:, i]
         if np.unique(y_i).size < 2:
-            continue
-        per_class.append(roc_auc_score(y_i, probs[:, i]))
-    if not per_class:
-        return float("nan")
-    return float(np.mean(per_class))
+            per_label_auc.append(float("nan"))
+        else:
+            per_label_auc.append(float(roc_auc_score(y_i, probs[:, i])))
+
+    valid_auc = [v for v in per_label_auc if not np.isnan(v)]
+    macro_auc = float(np.mean(valid_auc)) if valid_auc else float("nan")
+
+    comp_indices = [label_names.index(name) for name in COMPETITION_LABELS]
+    comp_aucs = []
+    for idx in comp_indices:
+        y_i = y_true[:, idx]
+        if np.unique(y_i).size < 2:
+            comp_aucs.append(float("nan"))
+        else:
+            comp_aucs.append(float(roc_auc_score(y_i, probs[:, idx])))
+    valid_comp = [v for v in comp_aucs if not np.isnan(v)]
+    comp_auc = float(np.mean(valid_comp)) if valid_comp else float("nan")
+
+    return {
+        "acc": acc,
+        "auc": macro_auc,
+        "per_label_acc": per_label_acc,
+        "per_label_auc": per_label_auc,
+        "comp_auc": comp_auc,
+    }
 
 
 def train_one_epoch(
@@ -130,10 +158,10 @@ def train_one_epoch(
     optimizer,
     device: torch.device,
     scaler: Optional[torch.cuda.amp.GradScaler],
-) -> tuple[float, float, float]:
+    label_names: List[str],
+) -> tuple[float, dict]:
     model.train()
     total_loss = 0.0
-    total_acc = 0.0
     num_samples = 0
     all_logits = []
     all_targets = []
@@ -157,15 +185,14 @@ def train_one_epoch(
             optimizer.step()
 
         total_loss += loss.item() * batch_size
-        total_acc += compute_accuracy(logits.detach(), targets) * batch_size
         num_samples += batch_size
         all_logits.append(logits.detach().cpu())
         all_targets.append(targets.detach().cpu())
 
     epoch_logits = torch.cat(all_logits, dim=0)
     epoch_targets = torch.cat(all_targets, dim=0)
-    auc = compute_auc(epoch_logits, epoch_targets)
-    return total_loss / num_samples, total_acc / num_samples, auc
+    metrics = compute_epoch_metrics(epoch_logits, epoch_targets, label_names)
+    return total_loss / num_samples, metrics
 
 
 @torch.no_grad()
@@ -174,10 +201,10 @@ def evaluate(
     loader: DataLoader,
     criterion,
     device: torch.device,
-) -> tuple[float, float, float]:
+    label_names: List[str],
+) -> tuple[float, dict]:
     model.eval()
     total_loss = 0.0
-    total_acc = 0.0
     num_samples = 0
     all_logits = []
     all_targets = []
@@ -191,15 +218,14 @@ def evaluate(
         loss = criterion(logits, targets)
 
         total_loss += loss.item() * batch_size
-        total_acc += compute_accuracy(logits, targets) * batch_size
         num_samples += batch_size
         all_logits.append(logits.detach().cpu())
         all_targets.append(targets.detach().cpu())
 
     epoch_logits = torch.cat(all_logits, dim=0)
     epoch_targets = torch.cat(all_targets, dim=0)
-    auc = compute_auc(epoch_logits, epoch_targets)
-    return total_loss / num_samples, total_acc / num_samples, auc
+    metrics = compute_epoch_metrics(epoch_logits, epoch_targets, label_names)
+    return total_loss / num_samples, metrics
 
 
 def save_checkpoint(
@@ -281,6 +307,14 @@ def main() -> None:
     label_columns = [c.strip() for c in args.label_cols.split(",") if c.strip()]
     if not label_columns:
         raise ValueError("No label columns provided.")
+    missing_comp = [name for name in COMPETITION_LABELS if name not in label_columns]
+    if missing_comp:
+        raise ValueError(
+            "Competition metric requires labels: "
+            + ", ".join(COMPETITION_LABELS)
+            + ". Missing: "
+            + ", ".join(missing_comp)
+        )
 
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     use_amp = args.amp and device.type == "cuda"
@@ -361,10 +395,12 @@ def main() -> None:
     best_path = os.path.join(args.output_dir, "best.pt")
 
     for epoch in range(start_epoch, args.epochs):
-        train_loss, train_acc, train_auc = train_one_epoch(
-            model, train_loader, criterion, optimizer, device, scaler
+        train_loss, train_metrics = train_one_epoch(
+            model, train_loader, criterion, optimizer, device, scaler, label_columns
         )
-        val_loss, val_acc, val_auc = evaluate(model, val_loader, criterion, device)
+        val_loss, val_metrics = evaluate(
+            model, val_loader, criterion, device, label_columns
+        )
         scheduler.step()
 
         if val_loss < best_loss:
@@ -379,9 +415,22 @@ def main() -> None:
 
         print(
             f"Epoch {epoch+1}/{args.epochs} "
-            f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} train_auc={train_auc:.4f} "
-            f"val_loss={val_loss:.4f} val_acc={val_acc:.4f} val_auc={val_auc:.4f}"
+            f"train_loss={train_loss:.4f} "
+            f"train_acc={train_metrics['acc']:.4f} train_auc={train_metrics['auc']:.4f} "
+            f"val_loss={val_loss:.4f} "
+            f"val_acc={val_metrics['acc']:.4f} val_auc={val_metrics['auc']:.4f} "
+            f"val_comp_auc={val_metrics['comp_auc']:.4f}"
         )
+        acc_line = "val_per_label_acc: " + " ".join(
+            f"{name}={val_metrics['per_label_acc'][i]:.3f}"
+            for i, name in enumerate(label_columns)
+        )
+        auc_line = "val_per_label_auc: " + " ".join(
+            f"{name}={val_metrics['per_label_auc'][i]:.3f}"
+            for i, name in enumerate(label_columns)
+        )
+        print(acc_line)
+        print(auc_line)
 
 
 if __name__ == "__main__":
