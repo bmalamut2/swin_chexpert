@@ -23,6 +23,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 import timm
 from timm.data import resolve_data_config, create_transform
+from tqdm import tqdm
 
 
 LABEL_COLUMNS_DEFAULT = [
@@ -137,7 +138,7 @@ def train_one_epoch(
     all_logits = []
     all_targets = []
 
-    for images, targets in loader:
+    for images, targets in tqdm(loader, desc="Train", leave=False):
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
         batch_size = images.size(0)
@@ -181,7 +182,7 @@ def evaluate(
     all_logits = []
     all_targets = []
 
-    for images, targets in loader:
+    for images, targets in tqdm(loader, desc="Val", leave=False):
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
         batch_size = images.size(0)
